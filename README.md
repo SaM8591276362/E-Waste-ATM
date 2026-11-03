@@ -1,4 +1,4 @@
-# E-Waste ATM ♻️
+# E-Waste ATM 
 
 ## About the Project
 E-Waste ATM is a web-based e-waste management and reward system developed as part of a college Ideathon event.
