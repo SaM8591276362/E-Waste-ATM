@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+<base target="_top">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body{font-family:Arial,sans-serif;margin:0;background:#f1f8f4;color:#1b3a2a}
+  .wrap{max-width:720px;margin:auto;padding:16px}
+  h1{font-size:20px;margin:8px 0}
+  .card{background:#fff;border-radius:12px;padding:14px;margin:12px 0;box-shadow:0 1px 4px #0002}
+  .big{font-size:36px;font-weight:bold;color:#2e7d32}
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;text-align:center}
+  .grid b{display:block;font-size:20px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  td,th{padding:6px 4px;border-bottom:1px solid #ddd;text-align:left}
+  .Approved,.Fulfilled{color:#2e7d32}.Rejected,.Cancelled{color:#c62828}.Pending{color:#ef6c00}
+  a.btn,button.btn{display:inline-block;background:#2e7d32;color:#fff;padding:10px 14px;border-radius:8px;text-decoration:none;border:none;cursor:pointer;font-size:14px}
+  input, select {width:100%;padding:8px;margin:6px 0 12px 0;box-sizing:border-box;border:1px solid #ccc;border-radius:4px}
+  label{font-weight:bold;font-size:13px}
+</style>
+</head>
+<body><div class="wrap">
+  <h1>E-WASTE ATM — STUDENT PORTAL</h1>
+  <div id="msg" class="card">Loading…</div>
+  <div id="app" style="display:none">
+    <div class="card"><div id="who"></div><div>Available points</div><div class="big" id="avail"></div>
+      <div class="grid"><div><b id="earned"></b>Earned</div><div><b id="reserved"></b>Reserved</div><div><b id="redeemed"></b>Redeemed</div></div></div>
+
+    <div class="card">
+      <b>Deposit e-waste</b>
+      <form id="depForm" onsubmit="handleDeposit(event)">
+        <label>Full name</label>
+        <input type="text" id="name" required>
+        <label>College student ID</label>
+        <input type="text" id="studentId" required>
+        <label>E-waste category</label>
+        <select id="category" required></select>
+        <label>Quantity</label>
+        <input type="number" id="qty" value="1" min="1" required>
+        <label>Photo of the item (required)</label>
+        <input type="file" id="photo" accept="image/jpeg" required>
+        <br><button type="submit" class="btn">Submit deposit</button>
+      </form>
+    </div>
+
+    <div class="card"><b>Deposit history</b><table id="dep"></table></div>
+    <div class="card"><b>Redemption history</b><table id="red"></table></div>
+    <div class="card"><b>Reward catalogue</b><table id="rew"></table></div>
+  </div>
+</div>
+<script>
+  let sessionToken = '';
+  const $ = id => document.getElementById(id);
+
+  function fill(tableId, head, rows) {
+    const t = $(tableId); t.innerHTML = '';
+    const hr = t.insertRow(); head.forEach(h => { const c = document.createElement('th'); c.textContent = h; hr.appendChild(c); });
+    if (!rows.length) { t.insertRow().insertCell().textContent = 'Nothing yet'; return; }
+    rows.forEach(r => { const tr = t.insertRow(); r.forEach((v, i) => { const c = tr.insertCell(); c.textContent = v === undefined || v === null ? '' : v;
+      if (head[i] === 'Status') c.className = v; }); });
+  }
+
+  function loadWallet() {
+    google.script.run.withFailureHandler(e => $('msg').textContent = 'Error: ' + e.message)
+    .withSuccessHandler(w => {
+      if (w.error) { $('msg').textContent = w.error; return; }
+      $('msg').style.display = 'none';$('app').style.display = 'block';
+      sessionToken = w.session; // Make sure your backend passes session if needed, or handle via token
+      $('who').textContent = (w.name || w.email) + ' · ' + (w.id || 'New Account');
+      if(w.name) $('name').value = w.name;
+      if(w.id) $('studentId').value = w.id;
+      
+      $('avail').textContent = w.available; $('earned').textContent = w.earned; $('reserved').textContent = w.reserved; $('redeemed').textContent = w.redeemed;
+      
+      // Populate Category Dropdown
+      const catSelect = $('category');
+      catSelect.innerHTML = '';
+      w.categories.forEach(cat => {
+        const opt = document.createElement('option');
+        opt.value = cat.name;
+        opt.textContent = `${cat.name} — ${cat.pts} pts each`;
+        catSelect.appendChild(opt);
+      });
+
+      fill('dep', ['Date', 'Item', 'Qty', 'Status', 'Points'], w.deposits.map(d => [d.when, d.item, d.qty, d.status, d.status === 'Approved' ? '+' + d.pts : (d.note || '0')]));
+      fill('red', ['Date', 'Reward', 'Status', 'Cost', 'Ref'], w.redemptions.map(r => [r.when, r.reward, r.status, r.status === 'Fulfilled' ? '-' + r.cost : r.cost, r.ref || r.note]));
+      fill('rew', ['ID', 'Reward', 'Points'], w.rewards.map(r => [r.id, r.name, r.pts]));
+    }).getWallet();
+  }
+
+  function handleDeposit(e) {
+    e.preventDefault();
+    const fileInput = $('photo');
+    if (!fileInput.files.length) { alert('Please select a photo'); return; }
+    const file = fileInput.files[0];
+    const reader = new FileReader();
+    reader.onload = function(evt) {
+      const base64Data = evt.target.result.split(',')[1];
+      const payload = {
+        token: Math.random().toString(36.substring(2, 10)),
+        id: $('studentId').value,
+        name: $('name').value,
+        category: $('category').value,
+        qty: Number($('qty').value),
+        photo: base64Data
+      };
+      google.script.run.withFailureHandler(err => alert('Deposit failed: ' + err.message))
+      .withSuccessHandler(res => {
+        alert(res.msg);
+        if(res.ok) loadWallet();
+      }).submitDeposit(payload);
+    };
+    reader.readAsDataURL(file);
+  }
+
+  loadWallet();
+</script>
+</body>
+</html>
