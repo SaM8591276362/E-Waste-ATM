@@ -1,0 +1,413 @@
+/**
+ * E-WASTE ATM — Code.gs
+ * Container-bound script of the spreadsheet "E-Waste ATM — Management System".
+ * Source of truth for points = the Ledger sheet. Student Accounts only displays it.
+ */
+const S = {DEPR:'Deposit Form Responses', REDR:'Redeem Form Responses', ACC:'Student Accounts',
+  DEP:'Deposit Transactions', REW:'Rewards Catalogue', RED:'Redemption Transactions',
+  DASH:'Admin Dashboard', CFG:'Config', LED:'Ledger', AUD:'Audit Log'};
+const OTHER = 'Other electronic item';
+const H = {
+  ACC:['Student ID','Student Name','Verified College Email','Total Points Earned','Points Reserved for Redemption','Points Redeemed','Available Points','Account Status','Last Updated'],
+  DEP:['Transaction ID','Form Response Reference','Timestamp','Student ID','Student Name','Item Category','Claimed Quantity','Verified Quantity','Points per Item','Calculated Points','Verification Status','Approved Points','Administrator ID','Decision Timestamp','Notes'],
+  REW:['Reward ID','Reward Name','Description','Points Required','Available Quantity','Reward Type','Status'],
+  RED:['Redemption ID','Request Timestamp','Student ID','Student Name','Reward ID','Reward Name','Quantity','Points Required','Redemption Status','Points Reserved','Points Deducted','Administrator ID','Approval Timestamp','Reward Issued Timestamp','Voucher or Collection Reference','Notes'],
+  LED:['Ledger ID','Timestamp','Student ID','Type','Earned Delta','Reserved Delta','Redeemed Delta','Ref ID','Administrator','Note','Unique Key'],
+  AUD:['Timestamp','Administrator','Action','Reference','Details']
+};
+
+/* ---------- MENU ---------- */
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('E-Waste ATM')
+    .addItem('Setup 1: create sheets', 'setupSheets')
+    .addItem('Setup 2: create both forms', 'createForms')
+    .addItem('Setup 3: install trigger', 'installTrigger')
+    .addItem('Refresh form dropdowns', 'refreshForms')
+    .addSeparator()
+    .addItem('Deposit: approve selected row', 'menuDepApprove')
+    .addItem('Deposit: reject selected row', 'menuDepReject')
+    .addSeparator()
+    .addItem('Redemption: approve selected row', 'menuRedApprove')
+    .addItem('Redemption: reject selected row', 'menuRedReject')
+    .addItem('Redemption: mark FULFILLED (reward issued)', 'menuRedFulfill')
+    .addItem('Redemption: cancel selected row', 'menuRedCancel')
+    .addSeparator()
+    .addItem('Adjust points (correction)', 'menuAdjust')
+    .addItem('Retry missed form submissions', 'menuRetry')
+    .addToUi();
+}
+
+/* ---------- SMALL HELPERS ---------- */
+const SS_ = () => SpreadsheetApp.getActiveSpreadsheet();
+function tbl_(name) {
+  const sh = SS_().getSheetByName(name);
+  if (!sh) throw new Error('Missing sheet: ' + name + '. Run Setup 1.');
+  return {sh, h: sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0]};
+}
+function rows_(name) {
+  const t = tbl_(name), n = t.sh.getLastRow() - 1;
+  if (n < 1) return [];
+  return t.sh.getRange(2, 1, n, t.h.length).getValues().map((r, i) => {
+    const o = {_row: i + 2}; t.h.forEach((k, j) => o[k] = r[j]); return o;
+  });
+}
+function put_(name, row, obj) {
+  const t = tbl_(name);
+  Object.keys(obj).forEach(k => {
+    const c = t.h.indexOf(k); if (c < 0) throw new Error('Bad column ' + k);
+    t.sh.getRange(row, c + 1).setValue(obj[k]);
+  });
+}
+function add_(name, obj) {
+  const t = tbl_(name);
+  t.sh.appendRow(t.h.map(k => obj[k] === undefined ? '' : obj[k]));
+}
+function withLock_(fn) {
+  const l = LockService.getScriptLock(); l.waitLock(30000);
+  try { return fn(); } finally { SpreadsheetApp.flush(); l.releaseLock(); }
+}
+const newId_ = p => p + '-' + Utilities.formatDate(new Date(), 'UTC', 'yyMMdd') + '-' + Utilities.getUuid().slice(0, 6).toUpperCase();
+function setting_(k) {
+  const v = tbl_(S.CFG).sh.getRange('E2:F30').getValues().find(r => r[0] === k);
+  return v ? v[1] : '';
+}
+function items_() {
+  const o = {};
+  tbl_(S.CFG).sh.getRange('A2:B30').getValues().forEach(r => { if (r[0]) o[String(r[0])] = Number(r[1]); });
+  return o;
+}
+function audit_(adm, action, ref, details) {
+  add_(S.AUD, {'Timestamp': new Date(), 'Administrator': adm, 'Action': action, 'Reference': ref, 'Details': details});
+}
+function admin_() {
+  const me = (Session.getActiveUser().getEmail() || Session.getEffectiveUser().getEmail() || '').toLowerCase();
+  const list = String(setting_('Admins')).toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+  if (!list.includes(me)) throw new Error('Not authorized: ' + me);
+  return me;
+}
+function mail_(to, subject, body) {
+  try { if (to) MailApp.sendEmail(to, '[E-Waste ATM] ' + subject, body); } catch (e) { console.warn('Mail failed: ' + e); }
+}
+const findAcc_ = id => rows_(S.ACC).find(a => String(a['Student ID']).toUpperCase() === String(id).toUpperCase());
+
+/* ---------- LEDGER (single source of truth) ---------- */
+// Returns true only if a NEW entry was written (idempotent via unique key).
+function ledger_(type, sid, earned, reserved, redeemed, ref, adm, note) {
+  const key = type + '|' + ref;
+  if (rows_(S.LED).some(r => r['Unique Key'] === key)) return false;
+  add_(S.LED, {'Ledger ID': newId_('LED'), 'Timestamp': new Date(), 'Student ID': sid, 'Type': type,
+    'Earned Delta': earned, 'Reserved Delta': reserved, 'Redeemed Delta': redeemed,
+    'Ref ID': ref, 'Administrator': adm, 'Note': note, 'Unique Key': key});
+  const a = findAcc_(sid); if (a) put_(S.ACC, a._row, {'Last Updated': new Date()});
+  return true;
+}
+function balance_(sid) {
+  const b = {earned: 0, reserved: 0, redeemed: 0};
+  rows_(S.LED).forEach(r => {
+    if (String(r['Student ID']).toUpperCase() !== String(sid).toUpperCase()) return;
+    b.earned += Number(r['Earned Delta']) || 0; b.reserved += Number(r['Reserved Delta']) || 0; b.redeemed += Number(r['Redeemed Delta']) || 0;
+  });
+  b.available = b.earned - b.reserved - b.redeemed; // Available = Earned − Reserved − Redeemed
+  return b;
+}
+function ensureAccount_(id, name, email) {
+  let a = findAcc_(id); if (a) return a;
+  const t = tbl_(S.ACC), r = t.sh.getLastRow() + 1;
+  t.sh.getRange(r, 1, 1, 9).setValues([[id, name, email,
+    `=SUMIFS(Ledger!$E:$E,Ledger!$C:$C,$A${r})`, `=SUMIFS(Ledger!$F:$F,Ledger!$C:$C,$A${r})`,
+    `=SUMIFS(Ledger!$G:$G,Ledger!$C:$C,$A${r})`, `=D${r}-E${r}-F${r}`, 'Active', new Date()]]);
+  return findAcc_(id);
+}
+function changeStock_(rewardId, delta) {
+  const r = rows_(S.REW).find(x => String(x['Reward ID']) === String(rewardId));
+  if (r && r['Available Quantity'] !== '') put_(S.REW, r._row, {'Available Quantity': Number(r['Available Quantity']) + delta});
+}
+
+/* ---------- FORM SUBMIT ROUTER ---------- */
+function onFormSubmit(e) {
+  const n = e.range.getSheet().getName(), row = e.range.getRow();
+  if (n === S.DEPR) processDepositRow_(row);
+  else if (n === S.REDR) processRedeemRow_(row);
+}
+function respRow_(sheet, row) { return rows_(sheet).find(r => r._row === row); }
+
+/* ---------- DEPOSIT PROCESSING ---------- */
+function processDepositRow_(row) {
+  withLock_(() => {
+    const txId = 'DEP-' + String(row).padStart(5, '0');        // deterministic => idempotent
+    if (rows_(S.DEP).some(r => r['Transaction ID'] === txId)) return;
+    const v = respRow_(S.DEPR, row); if (!v) return;
+    const id = String(v['College Student ID']).trim().toUpperCase(), name = String(v['Student Full Name']).trim();
+    const email = String(v['Email Address'] || '').trim().toLowerCase(), cat = String(v['E-Waste Item Category']).trim();
+    const qty = Number(v['Quantity Deposited']), max = Number(setting_('MaxQtyPerDeposit')) || 20;
+    const dom = String(setting_('AllowedEmailDomain') || '').toLowerCase();
+    let err = '';
+    if (!/^[A-Z0-9-]{3,20}$/.test(id)) err = 'Invalid student ID';
+    else if (!email || (dom && !email.endsWith('@' + dom))) err = 'Email missing or not allowed';
+    else if (!(cat in items_())) err = 'Unknown item category';
+    else if (!Number.isInteger(qty) || qty < 1 || qty > max) err = 'Invalid quantity (1-' + max + ')';
+    else {
+      const a = findAcc_(id);
+      if (a && String(a['Verified College Email']).toLowerCase() !== email) err = 'Student ID belongs to a different email';
+      else if (a && a['Account Status'] !== 'Active') err = 'Account not active';
+    }
+    add_(S.DEP, {'Transaction ID': txId, 'Form Response Reference': S.DEPR + '!R' + row, 'Timestamp': v['Timestamp'],
+      'Student ID': id, 'Student Name': name, 'Item Category': cat, 'Claimed Quantity': qty,
+      'Verification Status': err ? 'Rejected' : 'Pending', 'Approved Points': err ? 0 : '',
+      'Administrator ID': err ? 'SYSTEM' : '', 'Decision Timestamp': err ? new Date() : '', 'Notes': err});
+    if (!err) ensureAccount_(id, name, email);
+    else mail_(email, 'Deposit ' + txId + ' rejected', 'Your deposit request ' + txId + ' was rejected: ' + err + '.');
+  });
+}
+
+function decideDeposit_(txId, approve, qty, ppiIn, note, adm) {
+  return withLock_(() => {
+    const t = rows_(S.DEP).find(r => r['Transaction ID'] === txId);
+    if (!t) throw new Error('Transaction not found');
+    if (t['Verification Status'] !== 'Pending') throw new Error('Already ' + t['Verification Status'] + ' — nothing changed.');
+    const sid = String(t['Student ID']), acc = findAcc_(sid), now = new Date();
+    if (!approve) {
+      put_(S.DEP, t._row, {'Verification Status': 'Rejected', 'Approved Points': 0, 'Administrator ID': adm, 'Decision Timestamp': now, 'Notes': note});
+      audit_(adm, 'DEPOSIT_REJECT', txId, note);
+      mail_(acc && acc['Verified College Email'], 'Deposit ' + txId + ' rejected', 'Your deposit ' + txId + ' was not approved. Reason: ' + note + '. Points earned: 0.');
+      return 'Rejected ' + txId;
+    }
+    const max = Number(setting_('MaxQtyPerDeposit')) || 20;
+    if (!Number.isInteger(qty) || qty < 1 || qty > max) throw new Error('Verified quantity must be a whole number 1-' + max);
+    const ppi = t['Item Category'] === OTHER ? ppiIn : items_()[t['Item Category']];
+    if (typeof ppi !== 'number' || isNaN(ppi) || ppi < 0) throw new Error('Invalid points per item');
+    const pts = qty * ppi;
+    ledger_('EARN', sid, pts, 0, 0, txId, adm, 'Deposit approved');       // idempotent
+    put_(S.DEP, t._row, {'Verified Quantity': qty, 'Points per Item': ppi, 'Calculated Points': pts, 'Verification Status': 'Approved',
+      'Approved Points': pts, 'Administrator ID': adm, 'Decision Timestamp': now, 'Notes': note});
+    audit_(adm, 'DEPOSIT_APPROVE', txId, qty + ' x ' + ppi + ' = ' + pts);
+    mail_(acc && acc['Verified College Email'], 'Deposit ' + txId + ' approved',
+      'Your deposit ' + txId + ' (' + t['Item Category'] + ' x' + qty + ') was approved. Points earned: ' + pts + '. Available now: ' + balance_(sid).available + '.');
+    return 'Approved ' + txId + ': +' + pts + ' points';
+  });
+}
+
+/* ---------- REDEMPTION PROCESSING ---------- */
+function processRedeemRow_(row) {
+  withLock_(() => {
+    const rid = 'RED-' + String(row).padStart(5, '0');
+    if (rows_(S.RED).some(r => r['Redemption ID'] === rid)) return;
+    const v = respRow_(S.REDR, row); if (!v) return;
+    const id = String(v['College Student ID']).trim().toUpperCase(), email = String(v['Email Address'] || '').trim().toLowerCase();
+    const rewardId = String(v['Reward Selection']).trim().split(/\s+/)[0], qty = Number(v['Quantity Requested']);
+    const acc = findAcc_(id), rew = rows_(S.REW).find(r => String(r['Reward ID']) === rewardId);
+    const maxQ = Number(setting_('MaxRedeemQty')) || 1;
+    let err = '', cost = 0;
+    if (!acc || String(acc['Verified College Email']).toLowerCase() !== email) err = 'Student ID not linked to this verified email';
+    else if (acc['Account Status'] !== 'Active') err = 'Account not active';
+    else if (!rew || rew['Status'] !== 'Active') err = 'Reward not available';
+    else if (!Number.isInteger(qty) || qty < 1 || qty > maxQ) err = 'Invalid quantity (1-' + maxQ + ')';
+    else {
+      cost = Number(rew['Points Required']) * qty;
+      const stock = rew['Available Quantity'];
+      if (stock !== '' && Number(stock) < qty) err = 'Out of stock';
+      else if (balance_(id).available < cost) err = 'Insufficient points: need ' + cost + ', available ' + balance_(id).available;
+    }
+    add_(S.RED, {'Redemption ID': rid, 'Request Timestamp': v['Timestamp'], 'Student ID': id, 'Student Name': acc ? acc['Student Name'] : '',
+      'Reward ID': rewardId, 'Reward Name': rew ? rew['Reward Name'] : '', 'Quantity': qty, 'Points Required': cost,
+      'Redemption Status': err ? 'Rejected' : 'Pending', 'Points Reserved': err ? 0 : cost, 'Points Deducted': 0,
+      'Administrator ID': err ? 'SYSTEM' : '', 'Notes': err});
+    if (err) { mail_(email, 'Redemption ' + rid + ' rejected', 'Your request was rejected: ' + err + '. No points were deducted.'); return; }
+    if (ledger_('RESERVE', id, 0, cost, 0, rid, 'SYSTEM', 'Points reserved')) changeStock_(rewardId, -qty);
+    mail_(email, 'Redemption ' + rid + ' received', 'We reserved ' + cost + ' points for ' + rew['Reward Name'] + '. Awaiting admin approval.');
+  });
+}
+
+function redAction_(rid, action, adm, ref, note) {
+  return withLock_(() => {
+    const t = rows_(S.RED).find(r => r['Redemption ID'] === rid);
+    if (!t) throw new Error('Redemption not found');
+    const allowed = {approve: ['Pending'], reject: ['Pending'], cancel: ['Pending', 'Approved'], fulfill: ['Approved']};
+    if (!allowed[action].includes(t['Redemption Status'])) throw new Error('Cannot ' + action + ' a ' + t['Redemption Status'] + ' request — nothing changed.');
+    const sid = String(t['Student ID']), cost = Number(t['Points Required']), qty = Number(t['Quantity']), now = new Date();
+    const acc = findAcc_(sid), to = acc && acc['Verified College Email'];
+    if (action === 'approve') {
+      put_(S.RED, t._row, {'Redemption Status': 'Approved', 'Administrator ID': adm, 'Approval Timestamp': now, 'Notes': note});
+      mail_(to, 'Redemption ' + rid + ' approved', 'Approved. Collect your reward when notified. Points stay reserved until issue.');
+    } else if (action === 'reject' || action === 'cancel') {
+      if (ledger_('RELEASE', sid, 0, -cost, 0, rid, adm, action)) changeStock_(t['Reward ID'], qty);
+      put_(S.RED, t._row, {'Redemption Status': action === 'reject' ? 'Rejected' : 'Cancelled', 'Points Reserved': 0, 'Administrator ID': adm, 'Notes': note});
+      mail_(to, 'Redemption ' + rid + ' ' + (action === 'reject' ? 'rejected' : 'cancelled'), 'Request ' + rid + ' was not completed. ' + cost + ' reserved points were released.');
+    } else {
+      ledger_('FINALIZE', sid, 0, -cost, cost, rid, adm, 'Reward issued');  // reserved -> redeemed, once
+      put_(S.RED, t._row, {'Redemption Status': 'Fulfilled', 'Points Reserved': 0, 'Points Deducted': cost, 'Administrator ID': adm,
+        'Reward Issued Timestamp': now, 'Voucher or Collection Reference': ref});
+      mail_(to, 'Reward ready: ' + rid, 'Your reward ' + t['Reward Name'] + ' is issued. Ref: ' + ref + '. Points deducted: ' + cost + '. Available: ' + balance_(sid).available + '.');
+    }
+    audit_(adm, 'REDEMPTION_' + action.toUpperCase(), rid, note || ref || '');
+    return rid + ' → ' + action + ' done';
+  });
+}
+
+/* ---------- ADMIN MENU ACTIONS ---------- */
+function sel_(name) {
+  const sh = SpreadsheetApp.getActiveSheet();
+  if (sh.getName() !== name) throw new Error('Open the "' + name + '" tab and click a row first.');
+  const r = sh.getActiveRange().getRow(); if (r < 2) throw new Error('Select a data row.');
+  const row = rows_(name).find(x => x._row === r); if (!row) throw new Error('Empty row.'); return row;
+}
+function ask_(msg) { const u = SpreadsheetApp.getUi(), r = u.prompt(msg); return r.getSelectedButton() === u.Button.OK ? r.getResponseText().trim() : null; }
+function run_(fn) { try { SpreadsheetApp.getUi().alert(fn() || 'Done'); } catch (e) { SpreadsheetApp.getUi().alert('⚠ ' + e.message); } }
+
+function menuDepApprove() { run_(() => {
+  const adm = admin_(), t = sel_(S.DEP);
+  const q = ask_('Physically verified quantity (student claimed ' + t['Claimed Quantity'] + '):'); if (q === null) return 'Cancelled';
+  let ppi = null;
+  if (t['Item Category'] === OTHER) { ppi = ask_('Points per item for this "Other" item:'); if (ppi === null) return 'Cancelled'; ppi = Number(ppi); }
+  return decideDeposit_(t['Transaction ID'], true, Number(q), ppi, '', adm);
+}); }
+function menuDepReject() { run_(() => {
+  const adm = admin_(), t = sel_(S.DEP), n = ask_('Reason for rejection:'); if (n === null) return 'Cancelled';
+  return decideDeposit_(t['Transaction ID'], false, 0, null, n, adm);
+}); }
+function menuRedApprove() { run_(() => { const a = admin_(), t = sel_(S.RED); return redAction_(t['Redemption ID'], 'approve', a, '', ''); }); }
+function menuRedReject() { run_(() => { const a = admin_(), t = sel_(S.RED), n = ask_('Reason:'); if (n === null) return 'Cancelled'; return redAction_(t['Redemption ID'], 'reject', a, '', n); }); }
+function menuRedCancel() { run_(() => { const a = admin_(), t = sel_(S.RED), n = ask_('Reason:'); if (n === null) return 'Cancelled'; return redAction_(t['Redemption ID'], 'cancel', a, '', n); }); }
+function menuRedFulfill() { run_(() => { const a = admin_(), t = sel_(S.RED), r = ask_('Voucher / collection reference:'); if (!r) return 'Reference required'; return redAction_(t['Redemption ID'], 'fulfill', a, r, ''); }); }
+
+function menuAdjust() { run_(() => {
+  const adm = admin_(), sid = (ask_('Student ID:') || '').toUpperCase(); if (!sid) return 'Cancelled';
+  const d = Number(ask_('Points to add (+) or remove (−):')), why = ask_('Reason (required):');
+  if (!Number.isInteger(d) || d === 0 || !why) return 'Invalid input';
+  return withLock_(() => {
+    if (!findAcc_(sid)) throw new Error('No such student');
+    if (balance_(sid).available + d < 0) throw new Error('Would make available balance negative');
+    const ref = newId_('ADJ'); ledger_('ADJUST', sid, d, 0, 0, ref, adm, why); audit_(adm, 'ADJUST', ref, sid + ' ' + d + ': ' + why);
+    return 'Adjusted ' + sid + ' by ' + d + ' (ref ' + ref + ')';
+  });
+}); }
+
+// Safe to run any time: only processes form rows that have no transaction yet, and repairs missing reservations.
+function menuRetry() { run_(() => {
+  admin_();
+  const dn = rows_(S.DEPR).map(r => r._row); dn.forEach(processDepositRow_);
+  rows_(S.REDR).map(r => r._row).forEach(processRedeemRow_);
+  rows_(S.RED).filter(r => ['Pending', 'Approved'].includes(r['Redemption Status'])).forEach(r =>
+    withLock_(() => { if (ledger_('RESERVE', String(r['Student ID']), 0, Number(r['Points Required']), 0, r['Redemption ID'], 'SYSTEM', 'repair')) changeStock_(r['Reward ID'], -Number(r['Quantity'])); }));
+  return 'Retry complete. No duplicates are created.';
+}); }
+
+/* ---------- STUDENT WEB APP (private wallet) ---------- */
+function doGet() { return HtmlService.createHtmlOutputFromFile('Student').setTitle('E-Waste ATM — Student Wallet'); }
+function getWallet() {
+  const me = (Session.getActiveUser().getEmail() || '').toLowerCase();       // identity comes from Google, never from input
+  if (!me) return {error: 'Please sign in with your college Google account.'};
+  const acc = rows_(S.ACC).find(a => String(a['Verified College Email']).toLowerCase() === me);
+  if (!acc) return {error: 'No account yet. Submit a deposit first.'};
+  const sid = String(acc['Student ID']), b = balance_(sid), tz = Session.getScriptTimeZone();
+  const f = d => d instanceof Date ? Utilities.formatDate(d, tz, 'dd MMM yyyy HH:mm') : '';
+  return {
+    id: sid, name: acc['Student Name'], earned: b.earned, reserved: b.reserved, redeemed: b.redeemed, available: b.available,
+    deposits: rows_(S.DEP).filter(r => String(r['Student ID']) === sid).reverse().map(r => ({id: r['Transaction ID'], when: f(r['Timestamp']),
+      item: r['Item Category'], qty: r['Verified Quantity'] || r['Claimed Quantity'], status: r['Verification Status'], pts: r['Approved Points'], note: r['Notes']})),
+    redemptions: rows_(S.RED).filter(r => String(r['Student ID']) === sid).reverse().map(r => ({id: r['Redemption ID'], when: f(r['Request Timestamp']),
+      reward: r['Reward Name'], status: r['Redemption Status'], cost: r['Points Required'], issued: f(r['Reward Issued Timestamp']), ref: r['Voucher or Collection Reference'], note: r['Notes']})),
+    rewards: rows_(S.REW).filter(r => r['Status'] === 'Active').map(r => ({id: r['Reward ID'], name: r['Reward Name'], pts: r['Points Required'], stock: r['Available Quantity']})),
+    redeemUrl: PropertiesService.getScriptProperties().getProperty('REDEEM_FORM_URL') || ''
+  };
+}
+
+/* ---------- SETUP ---------- */
+function setupSheets() {
+  const ss = SS_(), owner = Session.getEffectiveUser().getEmail();
+  Object.keys(H).forEach(k => {
+    const name = S[k]; let sh = ss.getSheetByName(name) || ss.insertSheet(name);
+    if (sh.getLastRow() === 0) sh.getRange(1, 1, 1, H[k].length).setValues([H[k]]).setFontWeight('bold').setBackground('#d9ead3');
+    sh.setFrozenRows(1);
+  });
+  let cfg = ss.getSheetByName(S.CFG) || ss.insertSheet(S.CFG);
+  if (cfg.getLastRow() === 0) {
+    cfg.getRange('A1:B8').setValues([['Item Category', 'Points per Item'], ['Charging cable', 5], ['Earphones', 5], ['Mobile charger', 10],
+      ['Keyboard', 10], ['Computer mouse', 10], ['Old mobile phone', 25], [OTHER, 0]]);
+    cfg.getRange('E1:F5').setValues([['Setting', 'Value'], ['MaxQtyPerDeposit', 20], ['MaxRedeemQty', 2], ['AllowedEmailDomain', ''], ['Admins', owner]]);
+    cfg.getRange('A1:B1').setFontWeight('bold'); cfg.getRange('E1:F1').setFontWeight('bold');
+  }
+  const rw = tbl_(S.REW).sh;
+  if (rw.getLastRow() < 2) rw.getRange(2, 1, 6, 7).setValues([
+    ['R001', 'Eco-friendly bookmark', 'Recycled-paper bookmark', 20, 50, 'Item', 'Active'],
+    ['R002', 'Pen or pencil set', 'Stationery set', 40, 30, 'Item', 'Active'],
+    ['R003', 'Sustainability certificate', 'Printed certificate', 50, 100, 'Certificate', 'Active'],
+    ['R004', 'College stationery kit', 'Kit', 75, 10, 'Item', 'Inactive'],
+    ['R005', 'Cafeteria voucher', 'Voucher', 100, 10, 'Voucher', 'Inactive'],
+    ['R006', 'Reusable water bottle', 'Bottle', 150, 5, 'Item', 'Inactive']]);   // activate only what you can really provide
+  buildDashboard_();
+  protectSheets_();
+  SpreadsheetApp.getUi().alert('Sheets ready. Edit the Config tab (Admins, points). Next: Setup 2.');
+}
+function buildDashboard_() {
+  const sh = SS_().getSheetByName(S.DASH) || SS_().insertSheet(S.DASH); sh.clear();
+  const D = "'Deposit Transactions'!", R = "'Redemption Transactions'!";
+  const rows = [
+    ['Total deposit requests', `=COUNTA(${D}A2:A)`], ['Approved deposits', `=COUNTIF(${D}K2:K,"Approved")`],
+    ['Rejected deposits', `=COUNTIF(${D}K2:K,"Rejected")`], ['Pending verification', `=COUNTIF(${D}K2:K,"Pending")`],
+    ['Total verified e-waste items', `=SUMIFS(${D}H2:H,${D}K2:K,"Approved")`], ['Total points awarded', `=SUMIFS(${D}L2:L,${D}K2:K,"Approved")`],
+    ['Registered students', `=COUNTA('Student Accounts'!A2:A)`], ['Total redemption requests', `=COUNTA(${R}A2:A)`],
+    ['Pending redemption requests', `=COUNTIF(${R}I2:I,"Pending")`], ['Rewards issued', `=COUNTIF(${R}I2:I,"Fulfilled")`],
+    ['Total points redeemed', `=SUM(${R}K2:K)`]];
+  sh.getRange(1, 1, 1, 2).setValues([['E-WASTE ATM — ADMIN DASHBOARD', '']]).setFontWeight('bold');
+  sh.getRange(2, 1, rows.length, 2).setValues(rows);
+  sh.getRange(14, 1).setValue('Top item categories (verified items)').setFontWeight('bold');
+  sh.getRange(15, 1).setFormula(`=IFERROR(QUERY(${D}A:L,"select F, sum(H) where K='Approved' group by F order by sum(H) desc label sum(H) 'Items'",1),"No data yet")`);
+}
+function protectSheets_() {
+  const owner = Session.getEffectiveUser().getEmail();
+  const admins = String(setting_('Admins')).split(',').map(s => s.trim()).filter(Boolean);
+  SS_().getSheets().forEach(sh => {
+    const p = sh.protect().setDescription('Admins only');
+    p.addEditors(admins.concat(owner));
+    p.removeEditors(p.getEditors().filter(u => u.getEmail() !== owner && !admins.includes(u.getEmail())));
+    if (p.canDomainEdit()) p.setDomainEdit(false);
+  });
+}
+
+function link_(form, name) {
+  const ss = SS_(), before = ss.getSheets().map(s => s.getSheetId());
+  form.setDestination(FormApp.DestinationType.SPREADSHEET, ss.getId()); SpreadsheetApp.flush();
+  const s = ss.getSheets().find(x => !before.includes(x.getSheetId())); if (s) s.setName(name);
+}
+function verifiedEmail_(f) { try { f.setEmailCollectionType(FormApp.EmailCollectionType.VERIFIED); } catch (e) { f.setCollectEmail(true); } }
+function createForms() {
+  const P = PropertiesService.getScriptProperties();
+  const d = FormApp.create('E-Waste ATM — Student Deposit Form');
+  d.setDescription('Register your electronic-waste deposit at the campus E-Waste ATM. Reward points are credited only after the physical deposit has been verified and approved. Safety: never insert loose, swollen or damaged batteries — hand them to the volunteer.');
+  verifiedEmail_(d);
+  d.addTextItem().setTitle('Student Full Name').setRequired(true);
+  d.addTextItem().setTitle('College Student ID').setRequired(true);
+  d.addListItem().setTitle('E-Waste Item Category').setChoiceValues(['x']).setRequired(true);
+  d.addTextItem().setTitle('Quantity Deposited').setRequired(true).setValidation(FormApp.createTextValidation().requireWholeNumber().build());
+  d.addListItem().setTitle('Collection Point or ATM ID').setChoiceValues(['ATM-01']).setRequired(true);
+  d.addCheckboxItem().setTitle('Confirmation').setChoiceValues(['I have submitted this item at the designated collection point']).setRequired(true);
+  link_(d, S.DEPR); P.setProperty('DEPOSIT_FORM_ID', d.getId());
+
+  const r = FormApp.create('E-Waste ATM — Redeem Rewards');
+  r.setDescription('Use your verified E-Waste ATM reward points to request an available reward. Your balance will be checked before the redemption is processed.');
+  verifiedEmail_(r);
+  r.addTextItem().setTitle('College Student ID').setRequired(true);
+  r.addListItem().setTitle('Reward Selection').setChoiceValues(['x']).setRequired(true);
+  r.addTextItem().setTitle('Quantity Requested').setRequired(true).setValidation(FormApp.createTextValidation().requireWholeNumber().build());
+  r.addCheckboxItem().setTitle('Confirmation').setChoiceValues(['I understand the point cost and that availability is limited']).setRequired(true);
+  link_(r, S.REDR); P.setProperty('REDEEM_FORM_ID', r.getId()); P.setProperty('REDEEM_FORM_URL', r.getPublishedUrl());
+  refreshForms();
+  SpreadsheetApp.getUi().alert('Forms created.\nDeposit: ' + d.getPublishedUrl() + '\nRedeem: ' + r.getPublishedUrl() + '\nNext: Setup 3.');
+}
+function refreshForms() {
+  const P = PropertiesService.getScriptProperties();
+  const set = (formId, title, vals) => {
+    const f = FormApp.openById(formId), it = f.getItems(FormApp.ItemType.LIST).find(i => i.getTitle() === title);
+    if (it) it.asListItem().setChoiceValues(vals.length ? vals : ['(none available)']);
+  };
+  set(P.getProperty('DEPOSIT_FORM_ID'), 'E-Waste Item Category', Object.keys(items_()));
+  set(P.getProperty('REDEEM_FORM_ID'), 'Reward Selection', rows_(S.REW)
+    .filter(r => r['Status'] === 'Active' && (r['Available Quantity'] === '' || Number(r['Available Quantity']) > 0))
+    .map(r => r['Reward ID'] + ' - ' + r['Reward Name'] + ' (' + r['Points Required'] + ' pts)'));
+}
+function installTrigger() {
+  ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'onFormSubmit').forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('onFormSubmit').forSpreadsheet(SS_()).onFormSubmit().create();
+  SpreadsheetApp.getUi().alert('Trigger installed. Now deploy the web app (see README).');
+}
